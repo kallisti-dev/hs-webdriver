@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts, OverloadedStrings, RecordWildCards, ScopedTypeVariables, ConstraintKinds, PatternGuards, CPP #-}
+{-# LANGUAGE FlexibleContexts, OverloadedStrings, RecordWildCards, ScopedTypeVariables, ConstraintKinds, PatternGuards, CPP, LambdaCase #-}
 -- |The HTTP/JSON plumbing used to implement the 'WD' monad.
 --
 -- These functions can be used to create your own 'WebDriver' instances, providing extra functionality for your application if desired. All exports
@@ -24,7 +24,7 @@ import Network.HTTP.Types.Status (Status(..))
 import qualified Data.ByteString.Base64.Lazy as B64
 import qualified Data.ByteString.Char8 as BS
 import Data.ByteString.Lazy.Char8 (ByteString)
-import Data.ByteString.Lazy.Char8 as LBS (length, unpack, null)
+import Data.ByteString.Lazy.Char8 as LBS (unpack, null)
 import qualified Data.ByteString.Lazy.Internal as LBS (ByteString(..))
 import Data.CallStack
 import Data.Text as T (Text, splitOn, null)
@@ -44,6 +44,11 @@ import Data.Default.Class
 
 import Prelude -- hides some "unused import" warnings
 
+import Control.Monad.IO.Class
+import Data.Char
+import System.Environment
+import Text.Pretty.Simple
+
 --This is the defintion of fromStrict used by bytestring >= 0.10; we redefine it here to support bytestring < 0.10
 fromStrict :: BS.ByteString -> LBS.ByteString
 fromStrict bs | BS.null bs = LBS.Empty
@@ -58,30 +63,39 @@ defaultRequest = HTTPClient.defaultRequest
 defaultRequest = def
 #endif
 
+printInDebugEnv :: Show a => a -> IO ()
+printInDebugEnv s = do
+  mDebug <- lookupEnv "WEBDRIVER_DEBUG"
+  case mDebug of
+    Just x | fmap toLower x == "true" -> pPrint s
+    _ -> pure ()
+
 -- |Constructs an HTTP 'Request' value when given a list of headers, HTTP request method, and URL fragment
-mkRequest :: (WDSessionState s, ToJSON a) =>
+mkRequest :: (MonadIO s, WDSessionState s, ToJSON a) =>
              Method -> Text -> a -> s Request
 mkRequest meth wdPath args = do
   WDSession {..} <- getSession
   let body = case toJSON args of
         Null  -> ""   --passing Null as the argument indicates no request body
         other -> encode other
-  return defaultRequest
-    { host = wdSessHost
-    , port = wdSessPort
-    , path = wdSessBasePath `BS.append`  TE.encodeUtf8 wdPath
-    , requestBody = RequestBodyLBS body
-    , requestHeaders = wdSessRequestHeaders
-                       ++ [ (hAccept, "application/json;charset=UTF-8")
-                          , (hContentType, "application/json;charset=UTF-8") ]
-    , method = meth
+      req = defaultRequest
+        { host = wdSessHost
+        , port = wdSessPort
+        , path = wdSessBasePath `BS.append`  TE.encodeUtf8 wdPath
+        , requestBody = RequestBodyLBS body
+        , requestHeaders = wdSessRequestHeaders
+                           ++ [ (hAccept, "application/json;charset=UTF-8")
+                              , (hContentType, "application/json;charset=UTF-8") ]
+        , method = meth
 #if !MIN_VERSION_http_client(0,5,0)
-    , checkStatus = \_ _ _ -> Nothing
+        , checkStatus = \_ _ _ -> Nothing
 #endif
-    }
+        }
+  liftIO $ printInDebugEnv req
+  return req
 
 -- |Sends an HTTP request to the remote WebDriver server
-sendHTTPRequest :: (WDSessionStateIO s) => Request -> s (Either SomeException (Response ByteString))
+sendHTTPRequest :: (MonadIO s, WDSessionStateIO s) => Request -> s (Either SomeException (Response ByteString))
 sendHTTPRequest req = do
   s@WDSession{..} <- getSession
   (nRetries, tryRes) <- liftBase . retryOnTimeout wdSessHTTPRetryCount $ httpLbs req wdSessHTTPManager
@@ -90,6 +104,7 @@ sendHTTPRequest req = do
                          , histRetryCount = nRetries
                          }
   putSession s { wdSessHist = wdSessHistUpdate h wdSessHist }
+  liftIO $ printInDebugEnv tryRes
   return tryRes
 
 retryOnTimeout :: Int -> IO a -> IO (Int, (Either SomeException a))
@@ -223,7 +238,19 @@ data WDResponse = WDResponse {
                   deriving (Eq, Show)
 
 instance FromJSON WDResponse where
-  parseJSON (Object o) = WDResponse <$> o .:?? "sessionId" .!= Nothing
-                                    <*> o .: "status"
-                                    <*> o .:?? "value" .!= Null
+  -- We try both options as the wire format changes depending on
+  -- whether selenium is running as a hub or standalone
+  parseJSON (Object o) = parseJSONSelenium o
+                         <|> (o .: "value" >>= parseJSONWebDriver)
   parseJSON v = typeMismatch "WDResponse" v
+
+parseJSONSelenium o = WDResponse <$> o .: "sessionId"
+                            <*> o .:?? "status" .!= 0
+                            <*> o .:?? "value" .!= Null
+
+parseJSONWebDriver (Object o) = do
+  sessionId <- o .:?? "sessionId" .!= Nothing
+  status <- o .:?? "status" .!= 0
+  pure $ WDResponse sessionId status (Object o)
+
+parseJSONWebDriver v = pure $ WDResponse Nothing 0 v
